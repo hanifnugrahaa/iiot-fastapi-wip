@@ -1,0 +1,7 @@
+__pycache__/
+venv/
+iiot_data.db
+test_db.py
+.env
+.pytest_cache/
+*.pyc
