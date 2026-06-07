@@ -25,6 +25,21 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s)
 
 
+def create_jwt(payload: dict) -> str:
+    # 24h expiration
+    payload_copy = payload.copy()
+    payload_copy['exp'] = int(datetime.datetime.utcnow().timestamp()) + (24 * 3600)
+    
+    header = {"alg": "HS256", "typ": "JWT"}
+    header_b64 = base64.urlsafe_b64encode(json.dumps(header).encode('utf-8')).decode('utf-8').rstrip('=')
+    payload_b64 = base64.urlsafe_b64encode(json.dumps(payload_copy).encode('utf-8')).decode('utf-8').rstrip('=')
+    
+    message = f"{header_b64}.{payload_b64}".encode('utf-8')
+    sig = hmac.new(JWT_SECRET.encode('utf-8'), message, hashlib.sha256).digest()
+    sig_b64 = base64.urlsafe_b64encode(sig).decode('utf-8').rstrip('=')
+    
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
+
 def verify_jwt(token: str):
     try:
         parts = token.split('.')
@@ -48,46 +63,26 @@ def verify_jwt(token: str):
 
 # ── RBAC ─────────────────────────────────────────────────────────
 
-import os
-
 def get_accessible_gateways(company_id: str, role: str):
     if role == 'role_admin' or company_id == 'comp_fmipa_ugm':
         return None  # None = all gateways
         
+    db = database.SessionLocal()
     try:
-        auth_file_path = os.path.join(os.path.dirname(__file__), '..', 'nextjs_iiot', 'data', 'auth.json')
-        if os.path.exists(auth_file_path):
-            with open(auth_file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                
-            # Find devices claimed by this company
-            claimed_devices = []
-            for device in data.get('devices', []):
-                if device.get('company_id') == company_id and device.get('status') == 'active':
-                    # The simulator gateways have IDs like "GW-IKEA-JKT-01" or SNs.
-                    # Wait, the frontend might be expecting the gateway's ID. 
-                    # Does the SN match the gateway ID in the simulator database?
-                    claimed_devices.append(device.get('sn'))
-                    
-            # Fallback to hardcoded just in case they haven't been provisioned yet but exist in legacy simulator
-            COMPANY_GATEWAYS = {
-                "comp_ikea_id": ["GW-IKEA-JKT-01", "GW-IKEA-SBY-01"],
-                "comp_indogrosir": ["GW-INDO-BDG-01", "GW-INDO-MDN-01"],
-            }
-            legacy_gateways = COMPANY_GATEWAYS.get(company_id, [])
-            
-            return list(set(claimed_devices + legacy_gateways))
-    except Exception as e:
-        print(f"Error reading auth.json: {e}")
+        # We find gateways that belong to this company
+        gateways = db.query(models.Gateway).filter(models.Gateway.company_id == company_id).all()
+        claimed_devices = [gw.id for gw in gateways]
         
-    # Absolute fallback
-    COMPANY_GATEWAYS = {
-        "comp_ikea_id": ["GW-IKEA-JKT-01", "GW-IKEA-SBY-01"],
-        "comp_indogrosir": ["GW-INDO-BDG-01", "GW-INDO-MDN-01"],
-    }
-    return COMPANY_GATEWAYS.get(company_id, [])
-
-
+        # Fallback to hardcoded just in case they haven't been provisioned yet
+        COMPANY_GATEWAYS = {
+            "comp_ikea_id": ["GW-IKEA-JKT-01", "GW-IKEA-SBY-01"],
+            "comp_indogrosir": ["GW-INDO-BDG-01", "GW-INDO-MDN-01"],
+        }
+        legacy_gateways = COMPANY_GATEWAYS.get(company_id, [])
+        
+        return list(set(claimed_devices + legacy_gateways))
+    finally:
+        db.close()
 
 # ── Data Formatting ──────────────────────────────────────────────
 
@@ -354,6 +349,120 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 
 
 # ── REST Endpoints ───────────────────────────────────────────────
+
+import uuid
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    name: str
+    company: str
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+@app.post("/api/v1/auth/register")
+def register(req: RegisterRequest):
+    db = database.SessionLocal()
+    try:
+        existing = db.query(models.User).filter(models.User.username == req.username).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Username already exists")
+        
+        password_hash = hashlib.sha256(req.password.encode()).hexdigest()
+        user_id = "user_" + str(uuid.uuid4()).replace("-", "")[:8]
+        company_id = "comp_" + req.company.lower().replace(" ", "_")
+        
+        new_user = models.User(
+            user_id=user_id,
+            username=req.username,
+            password_hash=password_hash,
+            role_id="role_operator",
+            name=req.name,
+            company=req.company,
+            company_id=company_id
+        )
+        db.add(new_user)
+        db.commit()
+        return {"success": True, "message": "User registered successfully"}
+    finally:
+        db.close()
+
+@app.post("/api/v1/auth/login")
+def login(req: LoginRequest):
+    db = database.SessionLocal()
+    try:
+        user = db.query(models.User).filter(models.User.username == req.username).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+            
+        password_hash = hashlib.sha256(req.password.encode()).hexdigest()
+        if user.password_hash != password_hash:
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+            
+        role = db.query(models.Role).filter(models.Role.id == user.role_id).first()
+        features = json.loads(role.features) if role else []
+        custom_features = json.loads(user.custom_features) if user.custom_features else []
+        combined_features = list(set(features + custom_features))
+        
+        payload = {
+            "sub": user.user_id,
+            "username": user.username,
+            "role": user.role_id,
+            "name": user.name,
+            "company": user.company,
+            "company_id": user.company_id,
+            "features": combined_features
+        }
+        token = create_jwt(payload)
+        
+        return {
+            "token": token,
+            "user": {
+                "id": user.user_id,
+                "username": user.username,
+                "name": user.name,
+                "role": user.role_id,
+                "company": user.company,
+                "companyId": user.company_id,
+                "features": combined_features
+            }
+        }
+    finally:
+        db.close()
+
+@app.get("/api/v1/auth/me")
+def get_me(token: str):
+    payload = verify_jwt(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        
+    db = database.SessionLocal()
+    try:
+        user = db.query(models.User).filter(models.User.user_id == payload['sub']).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        role = db.query(models.Role).filter(models.Role.id == user.role_id).first()
+        features = json.loads(role.features) if role else []
+        custom_features = json.loads(user.custom_features) if user.custom_features else []
+        combined_features = list(set(features + custom_features))
+        
+        return {
+            "user": {
+                "id": user.user_id,
+                "username": user.username,
+                "name": user.name,
+                "role": user.role_id,
+                "company": user.company,
+                "companyId": user.company_id,
+                "features": combined_features
+            }
+        }
+    finally:
+        db.close()
+
 
 class EnvConfigUpdate(BaseModel):
     temp_threshold: Optional[float] = None

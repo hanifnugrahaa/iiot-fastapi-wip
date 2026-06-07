@@ -85,3 +85,22 @@ class EnvNodeConfig(Base):
     no2_threshold = Column(Float, default=200.0)
     so2_threshold = Column(Float, default=180.0)
     o3_threshold = Column(Float, default=235.0)
+
+class Role(Base):
+    __tablename__ = "roles"
+
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String)
+    features = Column(Text, default="[]")  # JSON string of features
+
+class User(Base):
+    __tablename__ = "users"
+
+    user_id = Column(String, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    role_id = Column(String, index=True)
+    custom_features = Column(Text, default="[]")  # JSON string of customFeatures
+    name = Column(String)
+    company = Column(String)
+    company_id = Column(String, index=True)
