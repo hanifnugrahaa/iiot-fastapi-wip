@@ -104,3 +104,4 @@ class User(Base):
     name = Column(String)
     company = Column(String)
     company_id = Column(String, index=True)
+    preferences = Column(Text, default='{}')

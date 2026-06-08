@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.10
 
 # Hugging Face Spaces requires running as a non-root user
 RUN useradd -m -u 1000 user
@@ -8,8 +8,9 @@ ENV HOME=/home/user \
 
 WORKDIR $HOME/app
 
-# Install dependencies
+# Install Python dependencies
 COPY --chown=user requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip wheel
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files

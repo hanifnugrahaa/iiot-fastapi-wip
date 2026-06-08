@@ -4,11 +4,14 @@ import time
 import random
 import datetime
 
-MQTT_BROKER = "broker.hivemq.com"
-MQTT_PORT = 1883
-MQTT_TOPIC_PREFIX = "sinergi/iiot"
-
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+MQTT_BROKER = os.getenv("MQTT_BROKER", "127.0.0.1")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_TOPIC_PREFIX = "sinergi/iiot"
 
 # Warehouse gateway → node mappings
 BASE_GATEWAYS = {
@@ -102,21 +105,29 @@ def generate_vision_payload(gateway_id: str, room_area: float):
     }
 
 
-def on_publish(client, userdata, result):
-    pass
+# Initialize MQTT Client
+try:
+    if hasattr(mqtt, "CallbackAPIVersion"):
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    else:
+        client = mqtt.Client()
+except AttributeError:
+    client = mqtt.Client()
 
-
-client = mqtt.Client()
-client.on_publish = on_publish
-client.connect(MQTT_BROKER, MQTT_PORT, 60)
-
-print(f"🏭 SINERGI IIoT Warehouse Simulator")
-print(f"   Broker: {MQTT_BROKER}:{MQTT_PORT}")
-print(f"   Topic prefix: {MQTT_TOPIC_PREFIX}")
+print(f"[SIM] SINERGI IIoT Warehouse Simulator (MQTT Mode)")
+print(f"   MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
+print(f"   Topic Prefix: {MQTT_TOPIC_PREFIX}")
 print(f"   Gateways: {len(GATEWAYS)}")
 print(f"   Env nodes: {sum(len(g['env_nodes']) for g in GATEWAYS.values())}")
 print(f"   Vision nodes: {sum(len(g['cam_nodes']) for g in GATEWAYS.values())}")
 print()
+
+try:
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client.loop_start()
+except Exception as e:
+    print(f"[ERROR] Failed to connect to MQTT Broker: {e}")
+    exit(1)
 
 try:
     cycle = 0
@@ -131,9 +142,12 @@ try:
             node_id = random.choice(gateway["env_nodes"])
             payload = generate_env_payload(gateway_id)
             topic = f"{MQTT_TOPIC_PREFIX}/{gateway_id}/{node_id}"
-            msg = json.dumps(payload)
-            client.publish(topic, msg)
-            print(f"[ENV] {topic}: T={payload['temperature']}°C H={payload['humidity']}% Time={payload['timestamp']}")
+            
+            try:
+                client.publish(topic, json.dumps(payload))
+                print(f"[ENV] {gateway_id}/{node_id}: T={payload['temperature']}°C H={payload['humidity']}% Time={payload['timestamp']}")
+            except Exception as e:
+                print(f"[ERROR] Failed to send ENV data: {e}")
         else:
             # 30% chance: publish AI Vision data
             if gateway["cam_nodes"]:
@@ -141,13 +155,18 @@ try:
                 room_area = ROOM_AREAS.get(node_id, 100.0)
                 payload = generate_vision_payload(gateway_id, room_area)
                 topic = f"{MQTT_TOPIC_PREFIX}/{gateway_id}/{node_id}"
-                msg = json.dumps(payload)
-                client.publish(topic, msg)
-                print(f"[CAM] {topic}: persons={payload['person_count']} Time={payload['timestamp']}")
+                
+                try:
+                    client.publish(topic, json.dumps(payload))
+                    print(f"[CAM] {gateway_id}/{node_id}: persons={payload['person_count']} Time={payload['timestamp']}")
+                except Exception as e:
+                    print(f"[ERROR] Failed to send CAM data: {e}")
 
         # Sleep 1.5-3 seconds between messages
         time.sleep(random.uniform(1.5, 3.0))
 
 except KeyboardInterrupt:
-    print("\n🛑 Simulator stopped.")
+    print("\n[STOP] Simulator stopped.")
+finally:
+    client.loop_stop()
     client.disconnect()

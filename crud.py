@@ -444,3 +444,94 @@ def seed_warehouse_data(db: Session):
             db.add(models.AiVisionConfig(**vc))
 
     db.commit()
+
+# ── Historical Analytics ─────────────────────────────────────────
+from sqlalchemy import func
+
+def get_historical_telemetry(db: Session, node_ids: list[str], metric: str, time_range: str):
+    now = datetime.datetime.utcnow()
+    
+    if time_range == '24h':
+        start_time = now - datetime.timedelta(hours=24)
+        trunc_level = 'hour'
+    elif time_range == '7d':
+        start_time = now - datetime.timedelta(days=7)
+        trunc_level = 'day'
+    elif time_range == '30d':
+        start_time = now - datetime.timedelta(days=30)
+        trunc_level = 'day'
+    else:
+        start_time = now - datetime.timedelta(hours=24)
+        trunc_level = 'hour'
+        
+    # Default to temperature if metric not found
+    metric_col = getattr(models.SensorData, metric, models.SensorData.temperature)
+    
+    try:
+        # PostgreSQL specific aggregation
+        results = (
+            db.query(
+                models.SensorData.node_id,
+                func.date_trunc(trunc_level, models.SensorData.timestamp).label('time_bucket'),
+                func.avg(metric_col).label('avg_val'),
+                func.min(metric_col).label('min_val'),
+                func.max(metric_col).label('max_val')
+            )
+            .filter(models.SensorData.node_id.in_(node_ids))
+            .filter(models.SensorData.timestamp >= start_time)
+            .group_by(models.SensorData.node_id, 'time_bucket')
+            .order_by('time_bucket')
+            .all()
+        )
+        
+        # We also need global stats (avg, min, max) over the entire period per node
+        kpi_results = (
+            db.query(
+                models.SensorData.node_id,
+                func.avg(metric_col).label('avg_val'),
+                func.min(metric_col).label('min_val'),
+                func.max(metric_col).label('max_val')
+            )
+            .filter(models.SensorData.node_id.in_(node_ids))
+            .filter(models.SensorData.timestamp >= start_time)
+            .group_by(models.SensorData.node_id)
+            .all()
+        )
+        
+        # Format the data for the frontend
+        # Frontend Recharts expects: [{ time: "...", "NodeA": 25.5, "NodeB": 24.1 }, ...]
+        
+        time_series_map = {}
+        for row in results:
+            node_id = row.node_id
+            t_bucket = row.time_bucket.isoformat() if isinstance(row.time_bucket, datetime.datetime) else str(row.time_bucket)
+            avg_val = round(row.avg_val, 2) if row.avg_val else 0
+            
+            if t_bucket not in time_series_map:
+                time_series_map[t_bucket] = {"timestamp": t_bucket}
+            
+            time_series_map[t_bucket][node_id] = avg_val
+            
+        chart_data = list(time_series_map.values())
+        chart_data.sort(key=lambda x: x["timestamp"])
+        
+        kpi_data = {}
+        for row in kpi_results:
+            kpi_data[row.node_id] = {
+                "avg": round(row.avg_val, 2) if row.avg_val else 0,
+                "min": round(row.min_val, 2) if row.min_val else 0,
+                "max": round(row.max_val, 2) if row.max_val else 0,
+            }
+            
+        return {
+            "chartData": chart_data,
+            "kpiData": kpi_data
+        }
+    except Exception as e:
+        # Fallback for SQLite or error handling
+        print(f"Error in historical query: {e}")
+        return {
+            "chartData": [],
+            "kpiData": {},
+            "error": str(e)
+        }

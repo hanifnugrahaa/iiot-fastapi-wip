@@ -317,6 +317,10 @@ finally:
 
 app = FastAPI(title="SINERGI Industrial IoT Backend API")
 
+@app.on_event("startup")
+def startup_event():
+    start_mqtt_client(manager)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -457,9 +461,32 @@ def get_me(token: str):
                 "role": user.role_id,
                 "company": user.company,
                 "companyId": user.company_id,
-                "features": combined_features
+                "features": combined_features,
+                "preferences": json.loads(user.preferences) if user.preferences else {}
             }
         }
+    finally:
+        db.close()
+
+
+class PreferencesUpdate(BaseModel):
+    preferences: dict
+
+@app.put("/api/v1/auth/me/preferences")
+def update_preferences(req: PreferencesUpdate, token: str = Query(...)):
+    payload = verify_jwt(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        
+    db = database.SessionLocal()
+    try:
+        user = db.query(models.User).filter(models.User.user_id == payload['sub']).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        user.preferences = json.dumps(req.preferences)
+        db.commit()
+        return {"success": True, "message": "Preferences updated"}
     finally:
         db.close()
 
@@ -543,6 +570,37 @@ def update_node_info(node_id: str, body: NodeUpdate, background_tasks: Backgroun
     finally:
         db.close()
 
+
+from typing import Dict, Any
+
+@app.post("/api/v1/simulator/ingest/{gateway_id}/{node_id}")
+def simulator_ingest(gateway_id: str, node_id: str, payload: Dict[str, Any], background_tasks: BackgroundTasks):
+    db = database.SessionLocal()
+    try:
+        data_type = payload.get("type", "environmental")
+        if data_type == "environmental":
+            crud.save_env_sensor_data(db, gateway_id, node_id, payload)
+        elif data_type == "ai_vision":
+            crud.save_vision_snapshot(db, gateway_id, node_id, payload)
+        
+        # Broadcast gateway update
+        background_tasks.add_task(manager.broadcast_gateway_update, gateway_id)
+            
+        return {"status": "success"}
+    finally:
+        db.close()
+
+@app.get("/api/v1/telemetry/historical")
+def get_historical_telemetry_endpoint(node_ids: str = Query(...), metric: str = Query("temperature"), time_range: str = Query("24h")):
+    db = database.SessionLocal()
+    try:
+        node_id_list = [n.strip() for n in node_ids.split(",") if n.strip()]
+        result = crud.get_historical_telemetry(db, node_id_list, metric, time_range)
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
+        return result
+    finally:
+        db.close()
 
 @app.get("/")
 def read_root():
