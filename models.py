@@ -91,6 +91,7 @@ class Role(Base):
 
     id = Column(String, primary_key=True, index=True)
     name = Column(String)
+    badge_color = Column(String, default="#6b7280")
     features = Column(Text, default="[]")  # JSON string of features
 
 class User(Base):
@@ -105,3 +106,12 @@ class User(Base):
     company = Column(String)
     company_id = Column(String, index=True)
     preferences = Column(Text, default='{}')
+
+class DeviceRegistry(Base):
+    __tablename__ = "device_registry"
+
+    sn = Column(String, primary_key=True, index=True)
+    pin = Column(String)
+    status = Column(String, default="unclaimed")
+    company_id = Column(String, index=True, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)

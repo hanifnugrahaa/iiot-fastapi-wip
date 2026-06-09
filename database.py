@@ -7,13 +7,12 @@ from sqlalchemy.orm import sessionmaker
 # Load environment variables from .env file
 load_dotenv()
 
-# Support both Postgres and local SQLite via Environment Variables
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./iiot_data.db")
+# Support PostgreSQL via Environment Variables
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set. Please set it in .env to a valid PostgreSQL connection string.")
 
-# Only use check_same_thread for sqlite
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+engine = create_engine(DATABASE_URL)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

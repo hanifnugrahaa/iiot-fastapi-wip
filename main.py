@@ -12,6 +12,7 @@ import json
 import asyncio
 import datetime
 from typing import Optional
+from sqlalchemy import text
 
 JWT_SECRET = "liquidglass_secret_token_2026"
 
@@ -63,8 +64,8 @@ def verify_jwt(token: str):
 
 # ── RBAC ─────────────────────────────────────────────────────────
 
-def get_accessible_gateways(company_id: str, role: str):
-    if role == 'role_admin' or company_id == 'comp_fmipa_ugm':
+def get_accessible_gateways(company_id: str, features: list):
+    if 'view_all_nodes' in features:
         return None  # None = all gateways
         
     db = database.SessionLocal()
@@ -220,9 +221,9 @@ class ConnectionManager:
             if not payload:
                 raise Exception("Invalid JWT")
             
-            role = payload.get("role")
+            features = payload.get("features", [])
             company_id = payload.get("company_id")
-            accessible_gateways = get_accessible_gateways(company_id, role)
+            accessible_gateways = get_accessible_gateways(company_id, features)
 
             # Send initial full state
             db = database.SessionLocal()
@@ -308,6 +309,14 @@ manager = ConnectionManager()
 # Create DB tables
 models.Base.metadata.create_all(bind=database.engine)
 
+# Ensure badge_color column exists (PostgreSQL specific)
+try:
+    with database.engine.connect() as conn:
+        conn.execute(text("ALTER TABLE roles ADD COLUMN IF NOT EXISTS badge_color VARCHAR DEFAULT '#6b7280'"))
+        conn.commit()
+except Exception as e:
+    print(f"Warning: Failed to ensure badge_color column: {e}")
+
 # Seed warehouse data
 db = database.SessionLocal()
 try:
@@ -382,14 +391,14 @@ def register(req: RegisterRequest):
             user_id=user_id,
             username=req.username,
             password_hash=password_hash,
-            role_id="role_operator",
+            role_id="role_guest",
             name=req.name,
             company=req.company,
             company_id=company_id
         )
         db.add(new_user)
         db.commit()
-        return {"success": True, "message": "User registered successfully"}
+        return {"success": True, "message": "User registered successfully", "user_id": user_id}
     finally:
         db.close()
 
@@ -410,6 +419,10 @@ def login(req: LoginRequest):
         custom_features = json.loads(user.custom_features) if user.custom_features else []
         combined_features = list(set(features + custom_features))
         
+        is_plus = any(f not in features for f in custom_features)
+        roleDisplay = f"{role.name} plus" if (role and is_plus) else (role.name if role else user.role_id)
+        badgeColor = role.badge_color if role else "#6b7280"
+        
         payload = {
             "sub": user.user_id,
             "username": user.username,
@@ -417,7 +430,9 @@ def login(req: LoginRequest):
             "name": user.name,
             "company": user.company,
             "company_id": user.company_id,
-            "features": combined_features
+            "features": combined_features,
+            "roleDisplay": roleDisplay,
+            "badgeColor": badgeColor
         }
         token = create_jwt(payload)
         
@@ -430,7 +445,9 @@ def login(req: LoginRequest):
                 "role": user.role_id,
                 "company": user.company,
                 "companyId": user.company_id,
-                "features": combined_features
+                "features": combined_features,
+                "roleDisplay": roleDisplay,
+                "badgeColor": badgeColor
             }
         }
     finally:
@@ -487,6 +504,196 @@ def update_preferences(req: PreferencesUpdate, token: str = Query(...)):
         user.preferences = json.dumps(req.preferences)
         db.commit()
         return {"success": True, "message": "Preferences updated"}
+    finally:
+        db.close()
+
+
+class RoleCreate(BaseModel):
+    name: str
+    badgeColor: str
+    features: list[str]
+
+class RoleUpdate(BaseModel):
+    name: Optional[str] = None
+    badgeColor: Optional[str] = None
+    features: Optional[list[str]] = None
+
+class UserUpdate(BaseModel):
+    role_id: Optional[str] = None
+    customFeatures: Optional[list[str]] = None
+
+# ── Users RBAC ──
+@app.get("/api/v1/auth/users")
+def get_all_users(token: str):
+    payload = verify_jwt(token)
+    if not payload or 'manage_users' not in payload.get('features', []):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+        
+    db = database.SessionLocal()
+    try:
+        users = db.query(models.User).all()
+        roles = db.query(models.Role).all()
+        roles_dict = {r.id: r for r in roles}
+        
+        result = []
+        for u in users:
+            role = roles_dict.get(u.role_id)
+            c_feats = json.loads(u.custom_features) if u.custom_features else []
+            r_feats = json.loads(role.features) if role else []
+            
+            is_plus = any(f not in r_feats for f in c_feats)
+            roleDisplay = f"{role.name} plus" if (role and is_plus) else (role.name if role else u.role_id)
+            
+            result.append({
+                "user_id": u.user_id,
+                "username": u.username,
+                "name": u.name,
+                "company": u.company,
+                "company_id": u.company_id,
+                "role_id": u.role_id,
+                "customFeatures": c_feats,
+                "roleDisplay": roleDisplay,
+                "badgeColor": role.badge_color if role else "#6b7280"
+            })
+        return {"users": result}
+    finally:
+        db.close()
+
+@app.put("/api/v1/auth/users/{user_id}")
+def update_user_rbac(user_id: str, req: UserUpdate, token: str = Query(...)):
+    payload = verify_jwt(token)
+    if not payload or 'manage_users' not in payload.get('features', []):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+        
+    db = database.SessionLocal()
+    try:
+        user = db.query(models.User).filter(models.User.user_id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        if req.role_id is not None:
+            user.role_id = req.role_id
+        if req.customFeatures is not None:
+            user.custom_features = json.dumps(req.customFeatures)
+            
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+@app.delete("/api/v1/auth/users/{user_id}")
+def delete_user_rbac(user_id: str, token: str = Query(...)):
+    payload = verify_jwt(token)
+    if not payload or 'manage_users' not in payload.get('features', []):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+        
+    if user_id == payload['sub']:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+        
+    db = database.SessionLocal()
+    try:
+        user = db.query(models.User).filter(models.User.user_id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        db.delete(user)
+        db.commit()
+        return {"success": True}
+    finally:
+        db.close()
+
+# ── Roles RBAC ──
+@app.get("/api/v1/auth/roles")
+def get_all_roles(token: str):
+    payload = verify_jwt(token)
+    if not payload or 'manage_roles' not in payload.get('features', []):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+        
+    db = database.SessionLocal()
+    try:
+        roles = db.query(models.Role).all()
+        result = []
+        for r in roles:
+            result.append({
+                "id": r.id,
+                "name": r.name,
+                "badgeColor": r.badge_color,
+                "features": json.loads(r.features) if r.features else []
+            })
+        return {"roles": result}
+    finally:
+        db.close()
+
+@app.post("/api/v1/auth/roles")
+def create_role(req: RoleCreate, token: str = Query(...)):
+    payload = verify_jwt(token)
+    if not payload or 'manage_roles' not in payload.get('features', []):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+        
+    db = database.SessionLocal()
+    try:
+        new_role_id = "role_" + str(uuid.uuid4()).replace("-", "")[:8]
+        role = models.Role(
+            id=new_role_id,
+            name=req.name,
+            badge_color=req.badgeColor,
+            features=json.dumps(req.features)
+        )
+        db.add(role)
+        db.commit()
+        return {"success": True, "role": {
+            "id": role.id,
+            "name": role.name,
+            "badgeColor": role.badge_color,
+            "features": req.features
+        }}
+    finally:
+        db.close()
+
+@app.put("/api/v1/auth/roles/{role_id}")
+def update_role(role_id: str, req: RoleUpdate, token: str = Query(...)):
+    payload = verify_jwt(token)
+    if not payload or 'manage_roles' not in payload.get('features', []):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+        
+    db = database.SessionLocal()
+    try:
+        role = db.query(models.Role).filter(models.Role.id == role_id).first()
+        if not role:
+            raise HTTPException(status_code=404, detail="Role not found")
+            
+        if req.name is not None:
+            role.name = req.name
+        if req.badgeColor is not None:
+            role.badge_color = req.badgeColor
+        if req.features is not None:
+            role.features = json.dumps(req.features)
+            
+        db.commit()
+        return {"success": True, "role": {
+            "id": role.id,
+            "name": role.name,
+            "badgeColor": role.badge_color,
+            "features": json.loads(role.features) if role.features else []
+        }}
+    finally:
+        db.close()
+
+@app.delete("/api/v1/auth/roles/{role_id}")
+def delete_role(role_id: str, token: str = Query(...)):
+    payload = verify_jwt(token)
+    if not payload or 'manage_roles' not in payload.get('features', []):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+        
+    db = database.SessionLocal()
+    try:
+        role = db.query(models.Role).filter(models.Role.id == role_id).first()
+        if not role:
+            raise HTTPException(status_code=404, detail="Role not found")
+            
+        db.delete(role)
+        db.commit()
+        return {"success": True}
     finally:
         db.close()
 
@@ -647,3 +854,97 @@ def update_vision_config(node_id: str, body: VisionConfigUpdate, background_task
         }
     finally:
         db.close()
+
+# ── Provisioning & Device Registry ───────────────────────────────
+
+class DeviceGenerateRequest(BaseModel):
+    count: int = 1
+
+class DeviceClaimRequest(BaseModel):
+    sn: str
+    pin: str
+
+@app.get("/api/v1/provisioning/devices")
+def get_all_devices():
+    db = database.SessionLocal()
+    try:
+        devices = db.query(models.DeviceRegistry).all()
+        return {
+            "success": True,
+            "devices": [
+                {
+                    "sn": d.sn,
+                    "pin": d.pin,
+                    "status": d.status,
+                    "company_id": d.company_id,
+                    "created_at": d.created_at.isoformat() if d.created_at else None
+                } for d in devices
+            ]
+        }
+    finally:
+        db.close()
+
+@app.post("/api/v1/provisioning/devices/generate")
+def generate_devices(req: DeviceGenerateRequest):
+    import random
+    
+    if req.count < 1 or req.count > 100:
+        raise HTTPException(status_code=400, detail="Count must be between 1 and 100")
+        
+    db = database.SessionLocal()
+    try:
+        new_devices = []
+        for _ in range(req.count):
+            random_suffix = ''.join(random.choices("0123456789ABCDEF", k=4))
+            sn = f"SN-GW-2026-{random_suffix}"
+            pin = str(random.randint(10000000, 99999999))
+            
+            device = models.DeviceRegistry(
+                sn=sn,
+                pin=pin,
+                status="unclaimed",
+                company_id=None
+            )
+            db.add(device)
+            new_devices.append({
+                "sn": sn,
+                "pin": pin,
+                "status": "unclaimed",
+                "company_id": None,
+                "created_at": datetime.datetime.utcnow().isoformat()
+            })
+            
+        db.commit()
+        return {"success": True, "generated": new_devices}
+    finally:
+        db.close()
+
+@app.post("/api/v1/provisioning/devices/claim")
+def claim_device(req: DeviceClaimRequest, token: str = Query(...)):
+    payload = verify_jwt(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        
+    db = database.SessionLocal()
+    try:
+        device = db.query(models.DeviceRegistry).filter(models.DeviceRegistry.sn == req.sn).first()
+        if not device:
+            raise HTTPException(status_code=404, detail="Serial Number tidak ditemukan dalam sistem.")
+            
+        if device.pin != req.pin:
+            raise HTTPException(status_code=401, detail="PIN Keamanan salah.")
+            
+        if device.status != "unclaimed":
+            raise HTTPException(status_code=400, detail="Perangkat ini sudah diklaim oleh perusahaan lain.")
+            
+        device.status = "active"
+        device.company_id = payload.get("company_id")
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": "Perangkat berhasil diklaim dan dihubungkan ke dashboard Anda."
+        }
+    finally:
+        db.close()
+
