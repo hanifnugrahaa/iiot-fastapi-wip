@@ -5,12 +5,3 @@ test_db.py
 .env
 .pytest_cache/
 *.pyc
-
-# AI & Editor Traces
-.gemini/
-.cursor/
-.cline/
-implementation_plan.md
-task.md
-walkthrough.md
-scratch/
